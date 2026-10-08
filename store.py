@@ -1,5 +1,7 @@
 """SQLite-хранилище снимков политики, событий доступа и переходов состояний."""
+
 from __future__ import annotations
+
 import json
 import sqlite3
 import time
@@ -14,10 +16,8 @@ class EventStore:
         self._ensure_columns()
 
     def _init_db(self) -> None:
-        # WAL позволяет читать БД во время записи; busy_timeout ждёт освобождения блокировки.
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
-
         with self._conn:
             self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS policy_versions (
@@ -27,7 +27,6 @@ class EventStore:
                     target_dir TEXT NOT NULL,
                     snapshot_json TEXT NOT NULL,
                     parent_version_id INTEGER,
-                    source TEXT DEFAULT 'auto',
                     state_id INTEGER
                 );
             """)
@@ -98,7 +97,7 @@ class EventStore:
 
     def _ensure_columns(self) -> None:
         columns_by_table = {
-            "policy_versions": ["state_id", "parent_version_id", "source"],
+            "policy_versions": ["state_id", "parent_version_id"],
             "access_events": ["state_id", "session_id"],
             "policy_changes": ["state_id", "session_id", "suspicious"],
         }
@@ -108,26 +107,21 @@ class EventStore:
             }
             for col in cols:
                 if col not in existing:
-                    if col in {"state_id", "parent_version_id", "session_id"}:
+                    if col in {"state_id", "parent_version_id", "session_id", "suspicious"}:
                         col_type = "INTEGER"
-                    elif col == "source":
-                        col_type = "TEXT DEFAULT 'auto'"
                     else:
                         col_type = "TEXT"
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
 
-    # Снимки политики и их связь с предыдущим состоянием.
-
-    def add_policy_version(self, snapshot: dict, parent_version_id: int | None = None, source: str = "auto") -> int:
+    def add_policy_version(self, snapshot: dict, parent_version_id: int | None = None) -> int:
         snap_hash = snapshot.get("snapshot_hash", "")
         target_dir = snapshot.get("target_dir", "")
         ts = snapshot.get("timestamp", time.time())
         snap_json = json.dumps(snapshot, ensure_ascii=False)
-
         with self._conn:
             version_id = self._conn.execute(
-                "INSERT INTO policy_versions (hash, timestamp, target_dir, snapshot_json, parent_version_id, source, state_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (snap_hash, ts, target_dir, snap_json, parent_version_id, source, 0),
+                "INSERT INTO policy_versions (hash, timestamp, target_dir, snapshot_json, parent_version_id, state_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (snap_hash, ts, target_dir, snap_json, parent_version_id, 0),
             ).lastrowid
             self._conn.execute(
                 "UPDATE policy_versions SET state_id = ? WHERE id = ?",
@@ -159,15 +153,9 @@ class EventStore:
         rows = self._conn.execute(q).fetchall()
         return [(row[0], json.loads(row[1])) for row in rows]
 
-    def get_policy_version_ids(self) -> list[int]:
-        rows = self._conn.execute("SELECT id FROM policy_versions ORDER BY id DESC").fetchall()
-        return [row[0] for row in rows]
-
     def count_policy_versions(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) FROM policy_versions").fetchone()
         return row[0] if row else 0
-
-    # Сессии мониторинга привязаны к конкретной версии политики.
 
     def create_monitoring_session(self, state_id: int, description: str = "") -> int:
         row = self._conn.execute(
@@ -176,7 +164,6 @@ class EventStore:
         ).fetchone()
         if row is not None:
             return row[0]
-
         with self._conn:
             cursor = self._conn.execute(
                 "INSERT INTO monitoring_sessions (state_id, started_at, status, description) VALUES (?, ?, 'active', ?)",
@@ -200,9 +187,13 @@ class EventStore:
         ).fetchone()
         return row[0] if row else None
 
-    # Причина и время перехода между версиями политики.
-
-    def record_transition(self, from_state_id: int | None, to_state_id: int, reason: str, details: str | None = None) -> None:
+    def record_transition(
+        self,
+        from_state_id: int | None,
+        to_state_id: int,
+        reason: str,
+        details: str | None = None,
+    ) -> None:
         with self._conn:
             self._conn.execute(
                 "INSERT INTO state_transitions (from_state_id, to_state_id, ts, reason, details) VALUES (?, ?, ?, ?, ?)",
@@ -228,9 +219,12 @@ class EventStore:
             for r in rows
         ]
 
-    # События доступа и изменения прав хранятся вместе с версией и сессией.
-
-    def _normalize_state_session(self, version_id: int, state_id: int | None, session_id: int | None) -> tuple[int, int | None]:
+    def _normalize_state_session(
+        self,
+        version_id: int,
+        state_id: int | None,
+        session_id: int | None,
+    ) -> tuple[int, int | None]:
         state = version_id if state_id is None else int(state_id)
         if state != version_id:
             raise ValueError(
@@ -249,8 +243,17 @@ class EventStore:
                 )
         return state, session_id
 
-    def record_access(self, version_id, subject, path, action, allowed, ts,
-                      state_id=None, session_id=None) -> None:
+    def record_access(
+        self,
+        version_id,
+        subject,
+        path,
+        action,
+        allowed,
+        ts,
+        state_id=None,
+        session_id=None,
+    ) -> None:
         state, session = self._normalize_state_session(version_id, state_id, session_id)
         with self._conn:
             self._conn.execute(
@@ -258,9 +261,19 @@ class EventStore:
                 (version_id, state, session, ts, subject, path, action, 1 if allowed else 0),
             )
 
-    def record_policy_change(self, version_id, subject, path, action, new_mode,
-                             process, ts, state_id=None, session_id=None,
-                             suspicious=False) -> None:
+    def record_policy_change(
+        self,
+        version_id,
+        subject,
+        path,
+        action,
+        new_mode,
+        process,
+        ts,
+        state_id=None,
+        session_id=None,
+        suspicious=False,
+    ) -> None:
         state, session = self._normalize_state_session(version_id, state_id, session_id)
         with self._conn:
             self._conn.execute(
@@ -268,8 +281,11 @@ class EventStore:
                 (version_id, state, session, ts, subject, path, action, new_mode, process, 1 if suspicious else 0),
             )
 
-    def get_used_triples(self, since: float | None = None,
-                         version_id: int | None = None) -> set[tuple[str, str, str]]:
+    def get_used_triples(
+        self,
+        since: float | None = None,
+        version_id: int | None = None,
+    ) -> set[tuple[str, str, str]]:
         q = "SELECT DISTINCT subject, path, action FROM access_events WHERE allowed=1"
         params: list[Any] = []
         if version_id is not None:
@@ -281,8 +297,11 @@ class EventStore:
         rows = self._conn.execute(q, params).fetchall()
         return {(r[0], r[1], r[2]) for r in rows}
 
-    def get_violations(self, since: float | None = None,
-                       version_id: int | None = None) -> list[dict]:
+    def get_violations(
+        self,
+        since: float | None = None,
+        version_id: int | None = None,
+    ) -> list[dict]:
         q = "SELECT ts, subject, path, action FROM access_events WHERE allowed=0"
         params: list[Any] = []
         if version_id is not None:
@@ -331,13 +350,6 @@ class EventStore:
             params.append(subject)
         row = self._conn.execute(q, params).fetchone()
         return row[0] if row else 0
-
-    def has_any_event(self, version_id: int) -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM access_events WHERE policy_version_id=? LIMIT 1",
-            (version_id,),
-        ).fetchone()
-        return row is not None
 
     def close(self) -> None:
         self._conn.close()
